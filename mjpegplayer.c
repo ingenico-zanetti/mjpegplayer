@@ -26,12 +26,27 @@
 
 // ---------------- STRUCTS ----------------
 
+typedef enum {
+	RECV_STATE_WAIT_FOR_FFD8,
+	RECV_STATE_WAIT_FOR_D8,
+	RECV_STATE_WAIT_FOR_FFD9,
+	RECV_STATE_WAIT_FOR_D9
+} RecvState_e;
+
+#define RECEIVE_BUFFER_SIZE (32 * 1024)
+
 typedef struct {
     int sock;
 
+	unsigned char *recvBuffer;
+	int recvSize;  // size of malloc'd buffer
+	int recvLength;// actual length of data received and stored in the buffer
+	int recvIndex; // where we left of in the buffer during the analysis
+	RecvState_e state;
+
     unsigned char *tmp;
     int tmp_idx;
-    int tmp_started;
+    // int tmp_started;
 
     int index;
 
@@ -74,6 +89,9 @@ int parse_tcp_url(const char *url, char *host, int *port) {
 
     const char *p = url + 6;
     const char *c = strchr(p, ':');
+	if(NULL == c){
+		return -1;
+	}
 
     strncpy(host, p, c - p);
     host[c - p] = 0;
@@ -88,6 +106,83 @@ int read_jpeg(stream_t *s, unsigned char **buf, unsigned long *size) {
 
     unsigned char c;
 
+		if(0 == s->recvIndex){
+			size_t received = recv(s->sock, s->recvBuffer, s->recvSize, 0);
+			if(received > 0){
+				s->recvLength = received;
+			}else{
+				return(-1);
+			}
+		}
+		int remaining = s->recvLength - s->recvIndex;
+		unsigned char *p = s->recvBuffer + s->recvIndex;
+		while(remaining-- > 0){
+			if(0 == remaining){
+				s->recvIndex = 0;
+			}else{
+				s->recvIndex++;
+			}
+			unsigned char octet = *p++;
+			switch(s->state){
+				case RECV_STATE_WAIT_FOR_FFD8:
+					if(0xFF == octet){
+						s->state = RECV_STATE_WAIT_FOR_D8;
+						// fprintf(stderr, "RECV_STATE_WAIT_FOR_FFD8 -> RECV_STATE_WAIT_FOR_D8" "\n");
+					}
+					break;
+				case RECV_STATE_WAIT_FOR_D8:
+					if(0xD8 == octet){
+						s->state = RECV_STATE_WAIT_FOR_FFD9;
+						s->tmp[0] = 0xFF;
+						s->tmp[1] = 0xD8;
+						s->tmp_idx = 2;
+						// fprintf(stderr, "thread[%2d] detected start of JPEG" "\n", s->index);
+						// fprintf(stderr, "RECV_STATE_WAIT_FOR_FFD8 -> RECV_STATE_WAIT_FOR_D8" "\n");
+					}else{
+						// fprintf(stderr, "RECV_STATE_WAIT_FOR_FFD8 -> RECV_STATE_WAIT_FOR_D8" "\n");
+						s->state = RECV_STATE_WAIT_FOR_FFD8;
+					}
+					break;
+				case RECV_STATE_WAIT_FOR_FFD9:
+					if(0xFF == octet){
+						s->state = RECV_STATE_WAIT_FOR_D9;
+						// fprintf(stderr, "RECV_STATE_WAIT_FOR_FFD9 -> RECV_STATE_WAIT_FOR_D9" "\n");
+					}
+					if(s->tmp_idx < 1024 * 1024){
+						s->tmp[s->tmp_idx++] = octet;
+					}else{
+						// Scrap entire image and wait for the start of the next one
+						s->state = RECV_STATE_WAIT_FOR_FFD8;
+						fprintf(stderr, "SCRAP: RECV_STATE_WAIT_FOR_FFD9 -> RECV_STATE_WAIT_FOR_FFD8" "\n");
+					}
+					break;
+				case RECV_STATE_WAIT_FOR_D9:
+					if(s->tmp_idx < 1024 * 1024){
+						s->tmp[s->tmp_idx++] = octet;
+						if(0xD9 != octet){
+							s->state = RECV_STATE_WAIT_FOR_FFD9;
+							// fprintf(stderr, "RECV_STATE_WAIT_FOR_D9 -> RECV_STATE_WAIT_FOR_FFD9" "\n");
+						}else{
+							*buf = s->tmp;
+							*size = s->tmp_idx;
+							s->state = RECV_STATE_WAIT_FOR_FFD8;
+							// fprintf(stderr, "RECV_STATE_WAIT_FOR_D9 -> RECV_STATE_WAIT_FOR_FFD8" "\n");
+							// fprintf(stderr, "thread[%2d] detected end of JPEG" "\n", s->index);
+							return 1;
+						}
+					}else{
+						// Scrap entire image and wait for the start of the next one
+						s->state = RECV_STATE_WAIT_FOR_FFD8;
+						fprintf(stderr, "SCRAP: RECV_STATE_WAIT_FOR_D9 -> RECV_STATE_WAIT_FOR_FFD8" "\n");
+					}
+					break;
+				default:
+					fprintf(stderr, "Unknown RECV_STATE_xxx %d" "\n", s->state);
+					break;
+			}
+		}
+		return 0;
+#if 0
     while (recv(s->sock, &c, 1, 0) > 0) {
 
         if (!s->tmp_started) {
@@ -101,6 +196,7 @@ int read_jpeg(stream_t *s, unsigned char **buf, unsigned long *size) {
                     s->tmp[1] = 0xD8;
                     s->tmp_idx = 2;
                     s->tmp_started = 1;
+					fprintf(stderr, "thread[%2d] detected start of JPEG" "\n", s->index);
                 }
             }
 
@@ -118,6 +214,7 @@ int read_jpeg(stream_t *s, unsigned char **buf, unsigned long *size) {
                 s->tmp_idx = 0;
                 s->tmp_started = 0;
 
+				fprintf(stderr, "thread[%2d] detected end of JPEG" "\n", s->index);
                 return 1;
             }
         }
@@ -127,7 +224,7 @@ int read_jpeg(stream_t *s, unsigned char **buf, unsigned long *size) {
             s->tmp_started = 0;
         }
     }
-
+#endif
     return 0;
 }
 
@@ -361,10 +458,16 @@ void* thread_func(void *arg) {
         unsigned char *buf;
         unsigned long size;
 
-        if (!read_jpeg(c->s, &buf, &size))
-            break;
+        int result = read_jpeg(c->s, &buf, &size);
+		if(-1 == result){
+			break;
+		}
 
-        decode(c->s, c->drm, buf, size, c->total);
+		if(1 == result){
+			// fprintf(stderr, "thread[%2d]: before decode" "\n", c->s->index);
+			decode(c->s, c->drm, buf, size, c->total);
+			// fprintf(stderr, "thread[%2d]: after decode" "\n", c->s->index);
+		}
     }
 
     return NULL;
@@ -385,7 +488,7 @@ int main(int argc, char **argv) {
     stream_t *streams = calloc(n, sizeof(stream_t));
 
     drm_dev_t drm = {0};
-    drm.fd = open("/dev/dri/card1", O_RDWR);
+    drm.fd = open("/dev/dri/card0", O_RDWR);
     drm_init(&drm);
 
     pthread_t th[MAX_STREAMS];
@@ -401,6 +504,12 @@ int main(int argc, char **argv) {
         streams[i].sock = tcp_connect(host, port);
         streams[i].tmp = malloc(1024*1024);
         streams[i].index = i;
+
+		streams[i].recvBuffer = malloc(RECEIVE_BUFFER_SIZE);
+		streams[i].recvSize = RECEIVE_BUFFER_SIZE;
+		streams[i].recvLength = 0;
+		streams[i].recvIndex = 0;
+		streams[i].state = RECV_STATE_WAIT_FOR_FFD8;
 
         ctx[i].s = &streams[i];
         ctx[i].drm = &drm;
