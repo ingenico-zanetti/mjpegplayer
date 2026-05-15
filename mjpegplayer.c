@@ -488,7 +488,7 @@ int main(int argc, char **argv) {
     stream_t *streams = calloc(n, sizeof(stream_t));
 
     drm_dev_t drm = {0};
-    drm.fd = open("/dev/dri/card0", O_RDWR);
+    drm.fd = open("/dev/dri/card1", O_RDWR);
     drm_init(&drm);
 
     pthread_t th[MAX_STREAMS];
